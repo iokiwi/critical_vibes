@@ -2,11 +2,12 @@ import pygame
 import sys
 import os
 import random
+import math
+import numpy as np
 from collections import defaultdict
 
 ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 EXPLOSION_SOUND = os.path.join(ASSETS, "explosion.wav")
-BOMB_SVG = os.path.join(ASSETS, "bomb.svg")
 
 HEADER_H = 50
 WINDOW_W = 600
@@ -31,6 +32,13 @@ PLAYER_COLORS = [
 PLAYER_NAMES = ["Purple", "Green"]
 NUM_PLAYERS = 2
 
+ORB_RADIUS      = int(CELL_SIZE * 0.07)
+ORB_GLOW_RADIUS = int(CELL_SIZE * 0.40)
+ORB_ORBIT       = int(CELL_SIZE * 0.22)   # orbit radius for multi-orb cells
+ORB_SOLO_ORBIT  = int(CELL_SIZE * 0.10)   # gentle drift for single orb
+ORBIT_SPEED     = 1.2   # radians/sec
+PULSE_SPEED     = 2.5   # radians/sec
+
 
 def threshold(row, col):
     edges = (row == 0 or row == GRID_SIZE - 1) + (col == 0 or col == GRID_SIZE - 1)
@@ -50,24 +58,86 @@ def cell_center(row, col):
     return (col * CELL_SIZE + CELL_SIZE // 2, HEADER_H + row * CELL_SIZE + CELL_SIZE // 2)
 
 
-def make_bomb_surface(size, color):
-    surf = pygame.image.load_sized_svg(BOMB_SVG, (size, size)).convert_alpha()
-    tint = pygame.Surface((size, size), pygame.SRCALPHA)
-    tint.fill((*color, 255))
-    surf.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-    return surf
+def make_glow_surface(color, radius):
+    """Pre-compute a radial gradient glow surface using numpy. Brightest at center, zero at edge."""
+    size = radius * 2 + 1
+    # ogrid gives (row, col) == (y, x); surfarray uses (x, y) == (col, row)
+    y, x = np.ogrid[:size, :size]
+    dist = np.sqrt((x - radius) ** 2 + (y - radius) ** 2)
+    # Sharp core with a soft halo: mix a tight gaussian with a wide low glow
+    tight = np.exp(-(dist ** 2) / (radius * 0.15) ** 2)
+    halo  = np.exp(-(dist ** 2) / (radius * 0.55) ** 2) * 0.25
+    intensity = np.clip(tight + halo, 0.0, 1.0)
+    intensity_t = intensity.T  # (x, y) order for surfarray
 
-
-def make_fireball_surface(size):
     surf = pygame.Surface((size, size), pygame.SRCALPHA)
-    cx, cy, r = size // 2, size // 2, size // 2
-    for i in range(r, 0, -1):
-        t = i / r
-        green = int(180 * (1 - t) + 80 * t)
-        alpha = int(220 * (1 - t * 0.8))
-        pygame.draw.circle(surf, (255, green, 0, alpha), (cx, cy), i)
-    pygame.draw.circle(surf, (255, 255, 200, 240), (cx, cy), r // 3)
+    rgb = pygame.surfarray.pixels3d(surf)       # (w, h, 3)
+    alpha = pygame.surfarray.pixels_alpha(surf) # (w, h)
+    rgb[:, :, 0] = (color[0] * intensity_t).astype(np.uint8)
+    rgb[:, :, 1] = (color[1] * intensity_t).astype(np.uint8)
+    rgb[:, :, 2] = (color[2] * intensity_t).astype(np.uint8)
+    alpha[:, :] = (255 * intensity_t).astype(np.uint8)
+    del rgb, alpha  # release pixel locks
     return surf
+
+
+# Cache glow surfaces per (color, radius) so we don't recompute each frame
+_glow_cache: dict = {}
+
+def get_glow(color, radius):
+    key = (color, radius)
+    if key not in _glow_cache:
+        _glow_cache[key] = make_glow_surface(color, radius)
+    return _glow_cache[key]
+
+
+def draw_orb(screen, cx, cy, color, t_sec, phase_offset=0.0, pulse=True, alpha=255):
+    """Draw a single glowing energy orb: tiny bright core, smooth radial gradient glow."""
+    pulse_val = (math.sin(t_sec * PULSE_SPEED + phase_offset) + 1) / 2  # 0..1
+    glow_r = int(ORB_GLOW_RADIUS * (0.85 + 0.15 * pulse_val)) if pulse else ORB_GLOW_RADIUS
+
+    glow = get_glow(color, glow_r)
+    if alpha < 255:
+        glow = glow.copy()
+        glow.set_alpha(alpha)
+    screen.blit(glow, (cx - glow_r, cy - glow_r), special_flags=pygame.BLEND_RGBA_ADD)
+
+
+def draw_orbs(screen, cx, cy, color, count, t_sec):
+    """Draw `count` orbs orbiting (cx, cy)."""
+    count = min(count, 4)
+    if count == 1:
+        ox = cx + int(ORB_SOLO_ORBIT * math.cos(t_sec * ORBIT_SPEED))
+        oy = cy + int(ORB_SOLO_ORBIT * math.sin(t_sec * ORBIT_SPEED))
+        draw_orb(screen, ox, oy, color, t_sec, phase_offset=0.0)
+    else:
+        angle_step = (2 * math.pi) / count
+        for i in range(count):
+            angle = t_sec * ORBIT_SPEED + i * angle_step
+            ox = cx + int(ORB_ORBIT * math.cos(angle))
+            oy = cy + int(ORB_ORBIT * math.sin(angle))
+            draw_orb(screen, ox, oy, color, t_sec, phase_offset=i * angle_step)
+
+
+def draw_cursor_orb(screen, cx, cy, color, t_sec):
+    """Cursor orb — same style as board orbs, slightly larger."""
+    draw_orb(screen, cx, cy, color, t_sec, phase_offset=0.0, pulse=True)
+
+
+def draw_explosion_fireball(screen, cx, cy, t_sec, alpha=255):
+    """Expanding fiery burst for exploding cells."""
+    max_r = int(CELL_SIZE * 0.55)
+    pulse = (math.sin(t_sec * 18) + 1) / 2
+    r = int(max_r * (0.85 + 0.15 * pulse))
+    surf = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+    c = r + 1
+    for i in range(r, 0, -1):
+        frac = i / r
+        green = int(180 * (1 - frac) + 60 * frac)
+        a = int(alpha * 0.9 * (1 - frac * 0.7))
+        pygame.draw.circle(surf, (255, green, 0, a), (c, c), i)
+    pygame.draw.circle(surf, (255, 255, 200, int(alpha * 0.95)), (c, c), r // 3)
+    screen.blit(surf, (cx - c, cy - c), special_flags=pygame.BLEND_RGBA_ADD)
 
 
 class Cell:
@@ -81,9 +151,7 @@ class Cell:
 
 
 class WaveAnim:
-    """One wave: all cells exploding simultaneously this step."""
     def __init__(self, explosions, start_ms):
-        # explosions: list of (r, c, player, nbrs)
         self.explosions = explosions
         self.start_ms = start_ms
         self.board_updated = False
@@ -102,7 +170,7 @@ class GameState:
         self.has_placed = [False] * NUM_PLAYERS
         self.eliminated = [False] * NUM_PLAYERS
         self.winner = None
-        self.pending_wave = False  # a wave needs to be started
+        self.pending_wave = False
         self.current_anim = None
         self._preseed(5)
 
@@ -138,7 +206,6 @@ class GameState:
             self.pending_wave = True
 
     def _collect_wave(self):
-        """Find all cells currently at/above threshold and return explosion list."""
         explosions = []
         for r in range(GRID_SIZE):
             for c in range(GRID_SIZE):
@@ -146,28 +213,6 @@ class GameState:
                 if cell.count >= threshold(r, c):
                     explosions.append((r, c, cell.owner, neighbors(r, c)))
         return explosions
-
-    def _apply_wave(self, explosions):
-        """Apply one wave to the board: explode all cells simultaneously."""
-        # Accumulate incoming bombs per neighbor cell: {(r,c): (player, count)}
-        # Last writer per cell wins for ownership (wave color), counts stack.
-        incoming = defaultdict(lambda: [None, 0])  # (r,c) -> [last_player, total_incoming]
-
-        for r, c, player, nbrs in explosions:
-            cell = self.grid[r][c]
-            t = threshold(r, c)
-            remainder = cell.count % t  # bombs left after full explosion(s)
-            cell.count = remainder
-            if remainder == 0:
-                cell.owner = None
-            for nr, nc in nbrs:
-                incoming[(nr, nc)][0] = player  # last exploding neighbor wins color
-                incoming[(nr, nc)][1] += 1
-
-        for (nr, nc), (player, count) in incoming.items():
-            ncell = self.grid[nr][nc]
-            ncell.owner = player
-            ncell.count += count
 
     def update(self, now_ms, sound):
         if self.current_anim is None:
@@ -178,12 +223,9 @@ class GameState:
                 self.pending_wave = False
                 self._check_elimination()
                 return
-            # Clear exploding cells immediately (remainders applied in _apply_wave at PHASE_BOARD)
-            # Store pre-explosion snapshot for animation, apply board changes at PHASE_BOARD
             self.pending_wave = False
             self.current_anim = WaveAnim(explosions, now_ms)
             sound.play()
-            # Apply remainder immediately so the cell shows the right leftover count
             for r, c, player, nbrs in explosions:
                 cell = self.grid[r][c]
                 t = threshold(r, c)
@@ -196,7 +238,6 @@ class GameState:
 
         if p >= PHASE_BOARD and not self.current_anim.board_updated:
             self.current_anim.board_updated = True
-            # Deposit bombs into neighbors
             incoming = defaultdict(lambda: [None, 0])
             for r, c, player, nbrs in self.current_anim.explosions:
                 for nr, nc in nbrs:
@@ -206,7 +247,6 @@ class GameState:
                 ncell = self.grid[nr][nc]
                 ncell.owner = player
                 ncell.count += count
-            # Queue next wave only if enemies still have bombs (chain stops when they're wiped out)
             if self._has_overloaded_cells() and self._enemy_still_present():
                 self.pending_wave = True
 
@@ -218,15 +258,13 @@ class GameState:
     def _has_overloaded_cells(self):
         return any(
             self.grid[r][c].count >= threshold(r, c)
-            for r in range(GRID_SIZE)
-            for c in range(GRID_SIZE)
+            for r in range(GRID_SIZE) for c in range(GRID_SIZE)
         )
 
     def _enemy_still_present(self):
         owners = {
             self.grid[r][c].owner
-            for r in range(GRID_SIZE)
-            for c in range(GRID_SIZE)
+            for r in range(GRID_SIZE) for c in range(GRID_SIZE)
             if self.grid[r][c].owner is not None
         }
         return len(owners) > 1
@@ -266,24 +304,13 @@ def main():
     big_font = pygame.font.SysFont(None, 60)
     small_font = pygame.font.SysFont(None, 18)
 
-    solo_size     = int(CELL_SIZE * 0.7)
-    group_size    = int(CELL_SIZE * 0.38)
-    travel_size   = int(CELL_SIZE * 0.35)
-    cursor_size   = int(CELL_SIZE * 0.5)
-    fireball_size = int(CELL_SIZE * 0.9)
-
-    bomb_solo   = [make_bomb_surface(solo_size, c) for c in PLAYER_COLORS]
-    bomb_group  = [make_bomb_surface(group_size, c) for c in PLAYER_COLORS]
-    bomb_travel = [make_bomb_surface(travel_size, c) for c in PLAYER_COLORS]
-    bomb_cursor = [make_bomb_surface(cursor_size, c) for c in PLAYER_COLORS]
-    fireball    = make_fireball_surface(fireball_size)
-
     pygame.mouse.set_visible(False)
     state = GameState()
     hover_cell = None
 
     while True:
         now_ms = pygame.time.get_ticks()
+        t_sec = now_ms / 1000.0
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -307,27 +334,28 @@ def main():
         state.update(now_ms, explosion_sound)
 
         screen.fill(BG_COLOR)
-        draw_header(screen, font, state)
-        draw_grid(screen, state, bomb_solo, bomb_group, bomb_travel, fireball, small_font, hover_cell, now_ms)
+        draw_header(screen, font, state, t_sec)
+        draw_grid(screen, state, small_font, hover_cell, t_sec)
         if state.winner is not None:
             draw_winner(screen, big_font, state.winner)
 
-        cursor_surf = bomb_cursor[state.current_player]
-        screen.blit(cursor_surf, cursor_surf.get_rect(center=mouse_pos))
+        draw_cursor_orb(screen, mouse_pos[0], mouse_pos[1], PLAYER_COLORS[state.current_player], t_sec)
 
         pygame.display.flip()
         clock.tick(60)
 
 
-def draw_header(screen, font, state):
+def draw_header(screen, font, state, t_sec):
     p = state.current_player
-    pygame.draw.circle(screen, PLAYER_COLORS[p], (20, HEADER_H // 2), 10)
+    color = PLAYER_COLORS[p]
+    draw_orb(screen, 20, HEADER_H // 2, color, t_sec)
     label = font.render(f"{PLAYER_NAMES[p]}'s turn", True, TEXT_COLOR)
     screen.blit(label, (38, HEADER_H // 2 - label.get_height() // 2))
 
 
-def draw_grid(screen, state, bomb_solo, bomb_group, bomb_travel, fireball, small_font, hover_cell, now_ms):
+def draw_grid(screen, state, small_font, hover_cell, t_sec):
     anim = state.current_anim
+
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
             rect = pygame.Rect(col * CELL_SIZE, HEADER_H + row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
@@ -336,8 +364,9 @@ def draw_grid(screen, state, bomb_solo, bomb_group, bomb_travel, fireball, small
             pygame.draw.rect(screen, GRID_COLOR, rect, 1)
 
             cell = state.grid[row][col]
-            if cell.owner is not None:
-                draw_bombs(screen, cell, row, col, bomb_solo, bomb_group)
+            if cell.owner is not None and cell.count > 0:
+                cx, cy = cell_center(row, col)
+                draw_orbs(screen, cx, cy, PLAYER_COLORS[cell.owner], cell.count, t_sec)
 
             t = threshold(row, col)
             if t < 4:
@@ -347,46 +376,31 @@ def draw_grid(screen, state, bomb_solo, bomb_group, bomb_travel, fireball, small
     if anim is None:
         return
 
-    p = anim.progress(now_ms)
+    p = anim.progress(anim.start_ms + int(t_sec * 1000) - anim.start_ms)
+    p = anim.progress(int(t_sec * 1000))
 
-    # Fireball on each exploding cell
     for r, c, player, nbrs in anim.explosions:
         origin = cell_center(r, c)
+
+        # Fireball — fades out after PHASE_BOARD
         if p < PHASE_BOARD:
-            fb = fireball
+            fb_alpha = 255
         else:
             fade = 1.0 - (p - PHASE_BOARD) / (PHASE_DONE - PHASE_BOARD)
-            fb = fireball.copy()
-            fb.set_alpha(int(255 * fade))
-        screen.blit(fb, fb.get_rect(center=origin))
+            fb_alpha = int(255 * fade)
+        if fb_alpha > 0:
+            draw_explosion_fireball(screen, origin[0], origin[1], t_sec, alpha=fb_alpha)
 
-        # Travelling bombs
+        # Travelling orbs
         if PHASE_TRAVEL <= p < PHASE_BOARD:
             travel_t = (p - PHASE_TRAVEL) / (PHASE_BOARD - PHASE_TRAVEL)
             travel_t = 1 - (1 - travel_t) ** 2  # ease out
-            surf = bomb_travel[player]
+            color = PLAYER_COLORS[player]
             for nr, nc in nbrs:
                 dest = cell_center(nr, nc)
                 bx = origin[0] + (dest[0] - origin[0]) * travel_t
                 by = origin[1] + (dest[1] - origin[1]) * travel_t
-                screen.blit(surf, surf.get_rect(center=(int(bx), int(by))))
-
-
-def draw_bombs(screen, cell, row, col, bomb_solo, bomb_group):
-    p = cell.owner
-    cx = col * CELL_SIZE + CELL_SIZE // 2
-    cy = HEADER_H + row * CELL_SIZE + CELL_SIZE // 2
-    count = min(cell.count, 4)
-    if count == 1:
-        surf = bomb_solo[p]
-        screen.blit(surf, surf.get_rect(center=(cx, cy)))
-    else:
-        surf = bomb_group[p]
-        spacing = int(CELL_SIZE * 0.28)
-        offsets = [(-1, -1), (1, -1), (-1, 1), (1, 1)]
-        for i in range(count):
-            dx, dy = offsets[i]
-            screen.blit(surf, surf.get_rect(center=(cx + dx * spacing, cy + dy * spacing)))
+                draw_orb(screen, int(bx), int(by), color, t_sec, pulse=False)
 
 
 def draw_winner(screen, font, winner):
